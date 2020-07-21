@@ -1,2 +1,2 @@
-# delphi_lib
-delphi library
+# dukepow_lib
+my library
