@@ -11,7 +11,7 @@ uses
   {$IFNDEF FMX}
   ,Dialogs, Forms, ExtCtrls, Activex, ComCtrls, ShlObj,
   Graphics, StrUtils, DateUtils,  Imm,  ShellAPI,
-  urlMon,deskicon, mask, Registry, Controls, TlHelp32, JPEG
+  urlMon,deskicon, mask, Registry, Controls, TlHelp32, JPEG, JvLabel
   {$ENDIF}
   ;
 
@@ -85,8 +85,10 @@ type
     OrderID : String;
     function GetVersionInfo(AIdent: String): String;
     function GetApplicationVersion: String; {어플리케이션의 버젼 정보를 알수 있다}
-    function CheckExtApplication(Ext : String) : String;  {확장자와 연결된 어플이 있는지 확인후 어플이름 반환}
-    procedure Delay(TickTime : Integer);  //milisecond 만큼 대기한다.
+    function CheckExtApplications(Ext : String) : TStringList;  {확장자와 연결된 어플이 있는지 확인후 어플이름들 반환}
+    function CheckExtApplication(Ext : String; idx : integer = 0) : String;  {확장자와 연결된 어플이 있는지 확인후 어플이름 반환}
+    function GetApplicationPath : String;    // 현재 경로를 반환
+    procedure Delay(TickMilliTime : Int64);  //milisecond 만큼 대기한다.
     procedure ScreenShotRect(
        const ARect: TRect;              // 저장할 화면 영역
        AFileName: String;                 // 저장할 파일명
@@ -125,12 +127,13 @@ type
     procedure HidePress;
     procedure FTimerTimer(Sender: TObject);
 
-    function explode(srcstr:String; exp:String; arrpos:integer; blankignore : boolean = false):String;
+    function StringPop(srcstr : String; popChar : String = '"') : string;  //popchar 사이에 있는 글자 리턴
+    function explode(srcstr:String; exp:String; arrpos:integer; blankignore : boolean = false):String; //글자 쪼개기
     procedure explodeList(sepq: String; LineStr: String; var tmpList: TStringList);
     function explodeListFindAndValue(srcList : TStringList; FindKey : String; sepq : String) : String;
     function explodeCount(srcstr:String; exp:String; blankignore : boolean = false):integer;
     Function winexecAndWait32V2( FileName: String; Visibility: integer = SW_NORMAL;WaitPls : integer = 1): DWORD;
-    function IsRunningProcessCount(const ProcName: String) : Integer;
+    function IsRunningProcessCount(const ProcFileName: String) : Integer;
     Function exec( FileName: String; strparam:String = ''; ShowMode : integer = SW_NORMAL) : DWORD;
     function BoolToStr(aValue: Boolean; const aYes: string = 'ON'; const aNo: string = 'OFF'): string; overload;
     function StrToBool(aStr: String; const aTrue1 : string = 'True'; const aTrue2 : string = 'ON'; const cass : boolean = false) : boolean; overload;
@@ -181,9 +184,13 @@ type
     function EncodeURIComponent(const InputStr: string; const bQueryStr: Boolean): string; //자바스크립트랑은 다름
     function DecodeURIComponent(const Code: string): string;  //자바스크립트랑은 다름
     function ColorConvert(src : String; format : TColorConvertType = cctRGBtoBGR) : String;
+    procedure Wait(timeout_milli: integer);
 
     {엔코드 관련}
     function UrlEncodeToA(const S : String; DstCodePage: LongWord = CP_UTF8) : AnsiString;
+
+    {화면 폰트 관련}
+    function CalcFontSize(obj : TJvLabel; nWidth, nHeight : Integer; sText : string): Integer;
   private
     function RunasAdmin(AFileName: PChar; AParam: PChar = nil; ShowMode : integer = SW_SHOWNORMAL) : integer;
     {선언부}
@@ -217,7 +224,12 @@ const
   CR                   = #13;
   LF                   = #10;
   CRLF                 = CR+LF;
+  LFCR                 = LF+CR;
   EOM                  = CR+LF+'.'+CR+LF;
+  CETX                 = #03;
+  CENQ                 = #05;
+  CACK                 = #06;
+  CNAK                 = #21;
   LineEnding = #13#10;
 
   cAT                  = '@';
@@ -675,15 +687,15 @@ begin
   Result := PartitionType;
 end;
 
-Procedure TUJLib.Delay(TickTime : Integer);
+Procedure TUJLib.Delay(TickMilliTime : Int64);
 var
-Past,Now: Integer;
+Past,Now: Int64;
 begin
-  Past := GetTickCount;
+  Past := GetTickCount64;
   repeat
-    Now := GetTickCount;
+    Now := GetTickCount64;
     Application.ProcessMessages;
-  Until Now > Past + TickTime;
+  Until Now > Past + TickMilliTime;
 end;
 
 
@@ -1006,38 +1018,78 @@ begin
   Result := GetVersionInfo('FileVersion');
 end;
 
-function TUJLib.CheckExtApplication(Ext: String): String;  {확장자와 연결된 어플이 있는지 확인후 어플이름 반환}
+function TUJLib.GetApplicationPath : String;    // 현재 경로를 반환
+begin
+  Result := ExcludeTrailingBackslash( ExtractFilePath(ParamStr(0)) );
+end;
+
+
+function TUJLib.CheckExtApplication(Ext: String; idx : integer = 0): String;  {확장자와 연결된 어플이 있는지 확인후 어플이름 경로 반환}
+var
+  ck : TStringList;
+begin
+  ck := CheckExtApplications(Ext);
+  if Assigned(ck) then
+  begin
+    if idx < ck.Count then
+    begin
+      Result := ck.Strings[idx];
+    end else
+    begin
+      Result := ck.Strings[0];
+    end;
+  end else
+  begin
+    Result := '';
+  end;
+end;
+
+function TUJLib.CheckExtApplications(Ext : String) : TStringList;
+//컴퓨터\HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\.avi\OpenWithProgids
+//컴퓨터\HKEY_LOCAL_MACHINE\SOFTWARE\Classes\PotPlayer64.AVI\shell\open\command 로 수정 필요
 const
   EXT_KEY='Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\';
 var
   Reg: TRegistry;
+  FReg : TRegistry;
   i: Integer;
   sList: TStringList;
+  cpt : string;
 begin
-  Result:='';
+  Result:=TStringlist.Create;
 
   Reg:=TRegistry.Create;
+  FReg := TRegistry.Create;
   try
     Reg.RootKey:=HKEY_CURRENT_USER;
+    FReg.RootKey := HKEY_LOCAL_MACHINE;
     // 키가 (읽을 수) 없다면 관둠
-    if not Reg.OpenKeyReadOnly(EXT_KEY+'.'+Ext) then Exit;
+    if not Reg.OpenKeyReadOnly(EXT_KEY+'.'+ LowerCase(Ext) ) then Exit;
 
     // 만약 Application 이라는 값이 있다면 그 놈이 직빵 연결 프로그램
-    if Reg.ValueExists('Application') then Result:=Reg.ReadString('Application')
+    if Reg.ValueExists('Application') then
+      StringListAdd( Result, Reg.ReadString('Application'))
     // 없다면 OpenWithList 를 뒤짐
     else begin
       Reg.CloseKey;
       // 키가 (읽을 수) 없다면 관둠
-      if not Reg.OpenKeyReadOnly(EXT_KEY+'.'+Ext+'\OpenWithList') then Exit;
-      // ValueName 을 다 받아와서 가장 우선순위가 높다고 생각되는(-_-)
-      // a 의 Data 를 반환
+      if not Reg.OpenKeyReadOnly(EXT_KEY+'.'+LowerCase(Ext)+ '\OpenWithProgids') then Exit;
+
       sList:=TStringList.Create;
       try
         Reg.GetValueNames(sList);
-        for i:=0 to sList.Count-1 do begin
-          if sList[i]='a' then begin
-            Result:=Reg.ReadString(sList[i]);
-            break;
+        for i:=sList.Count-1 downto 0 do begin
+          cpt := copy( sList[i], ( sList[I].Length ) - (Ext.Length) + 1);
+          if CompareText(cpt , Ext) = 0 then
+          begin
+            if not FReg.OpenKeyReadOnly('SOFTWARE\Classes\' + sList[i] + '\shell\open\command') then break;
+            cpt := Freg.ReadString('');
+            cpt := StringPop(cpt,'"');
+            if FileExists(cpt) then
+            begin
+              StringListAdd(Result, cpt);
+//              break;
+            end;
           end;
         end;
       finally
@@ -1046,7 +1098,10 @@ begin
     end; // if ValueExists
   finally
     FreeAndNil(Reg);
+    FreeAndNil(FReg);
   end;
+  if Result.Count = 0 then
+    FreeAndNil(Result);
 //출처: https://bloodguy.tistory.com/entry/확장자에-연결된-프로그램이-있는지-알아보는-함수 [Bloodguy]
 end;
 
@@ -1379,6 +1434,19 @@ end;
 {$ENDIF}
 
 {------------------------ 윈도우디렉토리를 정확히한다  -----------------------------}
+procedure TUJLib.Wait(timeout_milli: integer);
+var
+  cut : TDateTime;
+begin
+  cut := now;
+  cut := IncMilliSecond(cut,timeout_milli);
+  while (cut > now) do
+  begin
+    Application.ProcessMessages;
+  end;
+  sleep(10);
+end;
+
 function TUJLib.WindowsDirFixup(APath:String):String;
 var s:string;      //마지막에 \ 붙지 않음
 
@@ -1831,6 +1899,8 @@ begin
   fmtStngs.TimeSeparator := ':';
   fmtStngs.LongTimeFormat := 'hh:nn:ss';
 
+  date := StringReplace(date, '24:00:00', '00:00:00', [rfReplaceAll]);
+
   Result := StrToDateTime(date, fmtStngs);
 end;
 
@@ -1943,6 +2013,22 @@ begin
   StrList.Free;
 end;
 
+function TUJLib.StringPop(srcstr : String; popChar : String = '"') : string;
+var
+  spos : integer;
+  sstr : string;
+begin
+  Result := '';
+  sstr := srcstr;
+  delete(sstr,1,(pos(popchar,srcstr) + popchar.Length - 1 ));
+
+  if pos(popchar,sstr) > 0 then
+  begin
+      sstr := copy(sstr,1,pos(popchar,sstr)-1);
+      Result := sstr;
+  end;
+end;
+
 {-------------------------------------------------------------------------------}
 function TUJLib.explodeCount(srcstr:String; exp:String; blankignore : boolean = false):integer;
 var StrList:TStringList;
@@ -1951,7 +2037,7 @@ begin
     StrList := TStringList.Create;
     StrList.Clear;
     while true do begin
-     if Pos(exp, srcstr) <> 0 then begin
+      if Pos(exp, srcstr) <> 0 then begin
         if blankignore then
           while copy(srcstr,1,length(exp)) = exp do
             Delete(srcstr,1,length(exp));
@@ -1962,11 +2048,12 @@ begin
           while copy(srcstr,1,length(exp)) = exp do
             Delete(srcstr,1,length(exp));
         continue;
-     end
-     else begin
-       StrList.Add(srcstr);
-       break;
-     end;
+      end
+      else begin
+        if srcstr <> '' then
+          StrList.Add(srcstr);
+        break;
+      end;
    end;
    Result := StrList.Count;
    StrList.Free;
@@ -2056,6 +2143,111 @@ begin
   end;
 end;
 {$ENDIF}
+
+// (1) 파일과 연관(association)된 프로그램으로 파일을 엽니다
+//     ShellExecute(Handle, 'open', PChar('test.txt'), nil, nil, SW_SHOW);
+
+// (2) notepad.exe 에 파라미터로 config.sys 파일을 주어 메모장을 실행합니다
+//     ShellExecute(Handle, 'open', 'notepad', 'c:\config.sys', nil, SW_SHOW);
+
+// (3) PC에 설치된 기본 웝브라우저로 지정한 사이트를 엽니다.
+//     ShellExecute(Handle, 'open', 'www.howto.pe.kr', nil, nil, SW_SHOW);
+
+// (4) 특정 폴더를 시작 폴더로 하는 윈도우즈 탐색기를 엽니다
+//     ShellExecute(Handle, 'explore', PChar('c:\windows)', nil, nil, SW_SHOW);
+
+// (5) readme.doc 파일을 연결된 프로그램으로 인쇄하고 화면을 닫습니다
+//     ShellExecute(Handle, 'print', 'readme.doc', nil, nil, SW_SHOW);
+    
+// (6) rMyDelphiFile.pas 파일을 wordpad 프로그램으로 인쇄하고 화면을 닫습니다
+//     ShellExecute(Handle, 'print', 'wordpad.wxe', 'MyDelphiFile.pas', nil, SW_SHOW);
+
+// (7) readme.doc 파일을 프린터를 선택하여 연결된 프로그램으로 인쇄하고 화면을 닫습니다
+//     var
+//       Device : array[0..255] of char;
+//       Driver : array[0..255] of char;
+//       Port   : array[0..255] of char;
+//       S: String;
+//       hDeviceMode: THandle;
+//     begin
+//       Printer.PrinterIndex := -1;  // 프린터 인덱스를 지정합니다. 여기서는 기본 프린터(-1) 선택
+//       Printer.GetPrinter(Device, Driver, Port, hDeviceMode);
+//       S := Format('"%s" "%s" "%s"',[Device, Driver, Port]);
+//       ShellExecute(Handle, 'printto', 'readme.doc', Pchar(S), nil, SW_HIDE);
+
+// (8) 기본 메일 프로그램을 실행합니다.
+//     ShellExecute(Handle, nil, 'mailto:cozy@howto.pe.kr', nil, nil, SW_SHOW);
+
+// (9) DOS 명령어를 실행하고 화면을 닫습니다
+//     ShellExecute(Handle, 'open', PChar('command.com'), PChar('/c copy file1.txt file2.txt'), nil, SW_SHOW);
+
+// (10) DOS 명령어를 실행하고 화면을 닫지 않습니다
+//      ShellExecute(Handle, 'open', PChar('command.com'), PChar('/k dir'), nil, SW_SHOW);
+
+// (11) ShellExecute()의 리턴값은 실행된 프로그램의 핸들이거나 에러코드입니다
+//      리턴값이 32 이하이면 에러가 발생한것으로 각각은 아래와 같은 의미가 있습니다
+
+//   var
+//     code: Integer;
+//   begin
+//     code := ShellExecute(...);
+//     if code <= 32 then ShowMessage(ShowShellExecuteError(code));
+//   end;
+    
+//   // ShellExecute()의 리턴코드에 대한 에러 메시지
+//   function ShowShellExecuteError(i: integer): String;
+//   begin
+//     case i of 0: result := 'The operating system is out of memory or resources.';
+//       ERROR_FILE_NOT_FOUND: result := 'The specified file was not found.';
+//       ERROR_PATH_NOT_FOUND: result := 'The specified path was not found.';
+//       ERROR_BAD_FORMAT: result := 'The .EXE file is invalid (non-Win32 .EXE or error in .EXE image).';
+//       SE_ERR_ACCESSDENIED: result := 'The operating system denied access to the specified file.';
+//       SE_ERR_ASSOCINCOMPLETE: result := 'The filename association is incomplete or invalid.';
+//       SE_ERR_DDEBUSY: result := 'The DDE transaction could not be completed because other DDE transactions were being processed.';
+//       SE_ERR_DDEFAIL: result := 'The DDE transaction failed.';
+//       SE_ERR_DDETIMEOUT: result := 'The DDE transaction could not be completed because the request timed out.';
+//       SE_ERR_DLLNOTFOUND: result := 'The specified dynamic-link library was not found.';
+//       //SE_ERR_FNF          : result:='The specified file was not found.';
+//       SE_ERR_NOASSOC           : result:='Unbekannter Extender.';
+//       SE_ERR_OOM: result := 'There was not enough memory to complete the operation.';
+//       //SE_ERR_PNF          : result:='The specified path was not found.';
+//       SE_ERR_SHARE: result := 'A sharing violation occurred.';
+//     end;
+//   end;
+
+// (12) ShellExecuteEx()를 이용하여 notepad.exe 를 실행한 후 종료될때까지 기다립니다
+//   var
+//     SEInfo: TShellExecuteInfo;
+//     ExitCode: DWORD;
+//     ExecuteFile, ParamString, StartInString: string;
+//   begin
+//     ExecuteFile   := 'notepad.exe';   // 실행할 프로그램
+//     ParamString   := 'c:\winzip.log'; // 프로그램의 명령행 파라미터
+//     StartInString := 'c:\';           // 시작 위치
+//     FillChar(SEInfo, SizeOf(SEInfo), 0);
+//     SEInfo.cbSize := SizeOf(TShellExecuteInfo);
+
+//     with SEInfo do
+//     begin
+//       fMask        := SEE_MASK_NOCLOSEPROCESS;
+//       Wnd          := Application.Handle;
+//       lpFile       := PChar(ExecuteFile);
+//       lpParameters := PChar(ParamString);
+//       lpDirectory  := PChar(StartInString);
+//       nShow        := SW_SHOWNORMAL;
+//     end;
+//     if ShellExecuteEx(@SEInfo) then
+//     begin
+//       repeat
+//         Application.ProcessMessages;
+//         GetExitCodeProcess(SEInfo.hProcess, ExitCode);
+//       until (ExitCode <> STILL_ACTIVE) or Application.Terminated;
+//       ShowMessage('프로그램이 종료되었습니다');
+//     end
+//     else ShowMessage('프로그램을 실행할 수 없습니다');
+// [출처] [공유] ShellExecute(Ex) 사용법 예제 12가지|작성자 Develop
+
+
 function TUJLib.RunasAdmin(AFileName: PChar; AParam: PChar = nil; ShowMode : integer = SW_SHOWNORMAL) : integer;
 var
   sei: TShellExecuteInfo;
@@ -2098,7 +2290,7 @@ begin
 end;
 {-------------------------------------------------------------------------------}
 { 프로세스 이름으로 몇개있는지 개수 리턴 }
-function TUJLib.IsRunningProcessCount(const ProcName: String) : Integer;
+function TUJLib.IsRunningProcessCount(const ProcFileName: String) : Integer;
 var
   Process32: TProcessEntry32;
   SHandle:   THandle;
@@ -2110,11 +2302,11 @@ begin
   Process32.dwSize:=SizeOf(TProcessEntry32);
   SHandle         :=CreateToolHelp32Snapshot(TH32CS_SNAPPROCESS, 0);
 
-  // 프로세스 리스트를 돌면서 매개변수로 받은 이름과 같은 프로세스가 있을 경우 True를 반환하고 루프종료
+  // 프로세스 리스트를 돌면서 매개변수로 받은 이름과 같은 프로세스가 있을 경우 count 증가하고 루프종료
   if Process32First(SHandle, Process32) then begin
     repeat
       Next:=Process32Next(SHandle, Process32);
-      if AnsiCompareText(Process32.szExeFile, Trim(ProcName))=0 then begin
+      if AnsiCompareText(Process32.szExeFile, Trim(ProcFileName))=0 then begin
          inc(Result);
       end;
     until not Next;
@@ -2294,6 +2486,32 @@ begin
     end;
     SetLength(RStr, J);
     Result := RStr;
+end;
+
+function TUJLib.CalcFontSize(obj : TJvLabel; nWidth, nHeight : Integer; sText : string): Integer;
+
+Const
+  MAX_FONT_SIZE = 144;
+  MIN_FONT_SIZE = 2;
+var
+  ARect : TRect;
+  I : Integer;
+begin
+
+  ARect := Default(TRect);
+  ARect.Right := nWidth;
+  ARect.Bottom := nHeight;
+
+  for I := MIN_FONT_SIZE to MAX_FONT_SIZE do
+  begin
+    (obj as TJvLabel).Canvas.Font.Size := I;
+    (obj as TJvLabel).Canvas.TextRect(ARect, sText, [tfCalcRect]);
+
+    if ((ARect.Right - ARect.Left) < nWidth)
+      and ((ARect.Bottom - ARect.Top) < nHeight) then
+        Result := I;
+  end;
+
 end;
 
 function TUJLib.GetUniqDayKey: String;  {13자리의 날짜로 생긴 유일키 만들기 }
